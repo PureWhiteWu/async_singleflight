@@ -133,14 +133,5 @@ mod tests {
         for h in handlers {
             rt.block_on(h);
         }
-        // tokio::spawn(|s| {
-        //     for _ in 0..10 {
-        //         s.spawn(|_| {
-        //             let res = g.work("key", expensive_fn);
-        //             assert_eq!(res, RES);
-        //         });
-        //     }
-        // })
-        // .unwrap();
     }
 }
