@@ -1,9 +1,20 @@
 [package]
 name = "async_singleflight"
-version = "0.1.0"
+version = "0.0.1"
 authors = ["Pure White <wudi.daniel@bytedance.com>"]
 edition = "2018"
+description = "Async singleflight."
+repository = "https://github.com/PureWhiteWu/async_singleflight"
+license = "MIT OR Apache-2.0"
+keywords = ["singleflight", "async"]
+categories = ["asynchronous", "concurrency", "caching"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+hashbrown = "0.2"
+tokio = {version = "1", features = ["sync"]}
+parking_lot = "0.11"
+
+[dev-dependencies]
+tokio = {version = "1", features = ["full"]}
