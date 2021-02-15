@@ -12,7 +12,7 @@ where
 {
     nt: Arc<Notify>,
     // TODO: how to share res through threads?
-    res: Arc<parking_lot::Mutex<Option<T>>>,
+    res: Arc<parking_lot::RwLock<Option<T>>>,
 }
 
 impl<T> Call<T>
@@ -22,7 +22,7 @@ where
     fn new() -> Call<T> {
         Call {
             nt: Arc::new(Notify::new()),
-            res: Arc::new(parking_lot::Mutex::new(None)),
+            res: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 }
@@ -66,7 +66,7 @@ where
             drop(m);
             // wait for notify
             nt.await;
-            let res = c.res.lock();
+            let res = c.res.read();
             return res.as_ref().unwrap().clone();
         }
 
@@ -79,7 +79,7 @@ where
         // grab lock before set result and notify waiters
         let mut m = self.m.lock().await;
         let c = m.get(key).unwrap();
-        let mut m2 = c.res.lock();
+        let mut m2 = c.res.write();
         *m2 = Some(res.clone());
         drop(m2);
         c.nt.notify_waiters();
@@ -131,7 +131,7 @@ mod tests {
             }));
         }
         for h in handlers {
-            rt.block_on(h);
+            rt.block_on(h).unwrap();
         }
     }
 }
