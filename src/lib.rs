@@ -1,3 +1,18 @@
+//! A singleflight implementation for tokio.
+//!
+//! Inspired by [singleflight](https://crates.io/crates/singleflight).
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use async_singleflight::Group;
+//!
+//! let g = Group::new();
+//! let res = g.work("key", return_res).await;
+//! assert_eq!(res, RES);
+//! ```
+//!
+
 use std::future::Future;
 use std::sync::Arc;
 
@@ -11,7 +26,7 @@ where
     T: Clone,
 {
     nt: Arc<Notify>,
-    // TODO: how to share res through threads?
+    // TODO: how to share res through threads without lock?
     res: Arc<parking_lot::RwLock<Option<T>>>,
 }
 
@@ -100,16 +115,16 @@ mod tests {
         7
     }
 
-    #[test]
-    fn test_simple() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+    #[tokio::test]
+    async fn test_simple() {
         let g = Group::new();
-        let res = rt.block_on(g.work("key", return_res));
+        let res = g.work("key", return_res).await;
         assert_eq!(res, RES);
     }
 
-    #[test]
-    fn test_multiple_threads() {
+    #[tokio::test]
+    async fn test_multiple_threads() {
+        use futures::future::join_all;
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -118,20 +133,16 @@ mod tests {
             RES
         }
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-
         let g = Arc::new(Group::new());
-
         let mut handlers = Vec::new();
         for _ in 0..10 {
             let g = g.clone();
-            handlers.push(rt.spawn(async move {
+            handlers.push(tokio::spawn(async move {
                 let res = g.work("key", expensive_fn).await;
                 println!("{}", res);
             }));
         }
-        for h in handlers {
-            rt.block_on(h).unwrap();
-        }
+
+        join_all(handlers).await;
     }
 }
