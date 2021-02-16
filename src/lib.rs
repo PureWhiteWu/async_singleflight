@@ -2,14 +2,36 @@
 //!
 //! Inspired by [singleflight](https://crates.io/crates/singleflight).
 //!
-//! # Usage
+//! # Examples
 //!
 //! ```no_run
+//! use futures::future::join_all;
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//!
 //! use async_singleflight::Group;
 //!
-//! let g = Group::new();
-//! let res = g.work("key", return_res).await;
-//! assert_eq!(res, RES);
+//! const RES: usize = 7;
+//!
+//! async fn expensive_fn() -> usize {
+//!     tokio::time::sleep(Duration::new(1, 500)).await;
+//!     RES
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let g = Arc::new(Group::new());
+//!     let mut handlers = Vec::new();
+//!     for _ in 0..10 {
+//!         let g = g.clone();
+//!         handlers.push(tokio::spawn(async move {
+//!             let res = g.work("key", expensive_fn).await;
+//!             println!("{}", res);
+//!         }));
+//!     }
+//!
+//!     join_all(handlers).await;
+//! }
 //! ```
 //!
 
