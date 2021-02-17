@@ -27,7 +27,7 @@
 //!         let g = g.clone();
 //!         handlers.push(tokio::spawn(async move {
 //!             let res = g.work("key", expensive_fn).await;
-//!             let r = res.as_ref().clone().as_ref().unwrap();
+//!             let r = res.as_ref().as_ref().unwrap();
 //!             println!("{}", r);
 //!         }));
 //!     }
@@ -146,8 +146,8 @@ mod tests {
     async fn test_simple() {
         let g = Group::new();
         let res = g.work("key", return_res).await;
-        let r = res.as_ref().clone().as_ref().unwrap().clone();
-        assert_eq!(r, RES);
+        let r = res.as_ref().as_ref().unwrap();
+        assert_eq!(r.clone(), RES);
     }
 
     #[tokio::test]
@@ -167,7 +167,7 @@ mod tests {
             let g = g.clone();
             handlers.push(tokio::spawn(async move {
                 let res = g.work("key", expensive_fn).await;
-                let r = res.as_ref().clone().as_ref().unwrap();
+                let r = res.as_ref().as_ref().unwrap();
                 println!("{}", r);
             }));
         }
