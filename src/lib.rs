@@ -46,19 +46,13 @@ use tokio::sync::{Mutex, Notify};
 
 // Call is an in-flight or completed call to work.
 #[derive(Clone)]
-struct Call<T>
-where
-    T: Clone,
-{
+struct Call<T> {
     nt: Arc<Notify>,
     // TODO: how to share res through threads without lock?
     res: Arc<parking_lot::RwLock<Option<Arc<Result<T>>>>>,
 }
 
-impl<T> Call<T>
-where
-    T: Clone,
-{
+impl<T> Call<T> {
     fn new() -> Call<T> {
         Call {
             nt: Arc::new(Notify::new()),
@@ -70,10 +64,7 @@ where
 /// Group represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
 #[derive(Default)]
-pub struct Group<T>
-where
-    T: Clone,
-{
+pub struct Group<T> {
     m: Mutex<HashMap<String, Arc<Call<T>>>>,
 }
 
@@ -114,8 +105,7 @@ where
         let c = Arc::new(Call::new());
         m.insert(key.to_owned(), c);
         drop(m);
-        let v = func().await;
-        let res = Arc::new(v);
+        let res = Arc::new(func().await);
 
         // grab lock before set result and notify waiters
         let mut m = self.m.lock().await;
