@@ -68,10 +68,7 @@ pub struct Group<T> {
     m: Mutex<HashMap<String, Arc<Call<T>>>>,
 }
 
-impl<T> Group<T>
-where
-    T: Clone,
-{
+impl<T> Group<T> {
     /// Create a new Group to do work with.
     pub fn new() -> Group<T> {
         Group {
