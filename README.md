@@ -1,3 +1,3 @@
 # Async singleflight
 
-Documentation: https://docs.rs/async_singleflight
+Documentation: [async_singleflight](https://docs.rs/async_singleflight).
