@@ -26,7 +26,7 @@
 //!     for _ in 0..10 {
 //!         let g = g.clone();
 //!         handlers.push(tokio::spawn(async move {
-//!             let res = g.work("key", expensive_fn).await;
+//!             let res = g.work("key", expensive_fn).await.0;
 //!             let r = res.as_ref().as_ref().unwrap();
 //!             println!("{}", r);
 //!         }));
@@ -79,7 +79,8 @@ impl<T> Group<T> {
     /// Execute and return the value for a given function, making sure that only one
     /// operation is in-flight at a given moment. If a duplicate call comes in, that caller will
     /// wait until the original call completes and return the same value.
-    pub async fn work<Fut>(&self, key: &str, func: impl Fn() -> Fut) -> Arc<Result<T>>
+    /// The second return value indicates whether the call is the owner.
+    pub async fn work<Fut>(&self, key: &str, func: impl Fn() -> Fut) -> (Arc<Result<T>>, bool)
     where
         Fut: Future<Output = Result<T>>,
     {
@@ -95,7 +96,7 @@ impl<T> Group<T> {
             // wait for notify
             nt.await;
             let res = c.res.read();
-            return Arc::clone(res.as_ref().unwrap());
+            return (Arc::clone(res.as_ref().unwrap()), false);
         }
 
         // insert call into map and start call
@@ -114,7 +115,7 @@ impl<T> Group<T> {
         m.remove(key).unwrap();
         drop(m);
 
-        res
+        (res, true)
     }
 }
 
@@ -132,7 +133,7 @@ mod tests {
     #[tokio::test]
     async fn test_simple() {
         let g = Group::new();
-        let res = g.work("key", return_res).await;
+        let res = g.work("key", return_res).await.0;
         let r = res.as_ref().as_ref().unwrap();
         assert_eq!(r.clone(), RES);
     }
@@ -153,7 +154,7 @@ mod tests {
         for _ in 0..10 {
             let g = g.clone();
             handlers.push(tokio::spawn(async move {
-                let res = g.work("key", expensive_fn).await;
+                let res = g.work("key", expensive_fn).await.0;
                 let r = res.as_ref().as_ref().unwrap();
                 println!("{}", r);
             }));
