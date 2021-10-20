@@ -9,19 +9,18 @@
 //! use std::sync::Arc;
 //! use std::time::Duration;
 //!
-//! use anyhow::Result;
 //! use async_singleflight::Group;
 //!
 //! const RES: usize = 7;
 //!
-//! async fn expensive_fn() -> Result<usize> {
+//! async fn expensive_fn() -> Result<usize, ()> {
 //!     tokio::time::sleep(Duration::new(1, 500)).await;
 //!     Ok(RES)
 //! }
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let g = Arc::new(Group::new());
+//!     let g = Arc::new(Group::<_, ()>::new());
 //!     let mut handlers = Vec::new();
 //!     for _ in 0..10 {
 //!         let g = g.clone();
@@ -144,11 +143,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::Group;
-    use anyhow::Result;
 
     const RES: usize = 7;
 
-    async fn return_res() -> Result<usize> {
+    async fn return_res() -> Result<usize, ()> {
         Ok(7)
     }
 
@@ -166,7 +164,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
 
-        async fn expensive_fn() -> Result<usize> {
+        async fn expensive_fn() -> Result<usize, ()> {
             tokio::time::sleep(Duration::new(1, 500)).await;
             Ok(RES)
         }
