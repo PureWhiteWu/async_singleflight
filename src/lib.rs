@@ -37,10 +37,10 @@
 //! ```
 //!
 
-use std::future::Future;
+use std::fmt::Debug;
 use std::sync::Arc;
+use std::{future::Future, marker::PhantomData};
 
-use anyhow::Result;
 use hashbrown::HashMap;
 use tokio::sync::{Mutex, Notify};
 
@@ -70,21 +70,24 @@ where
 /// Group represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
 #[derive(Default)]
-pub struct Group<T>
+pub struct Group<T, E>
 where
     T: Clone,
 {
     m: Mutex<HashMap<String, Arc<Call<T>>>>,
+    _marker: PhantomData<fn(E)>,
 }
 
-impl<T> Group<T>
+impl<T, E> Group<T, E>
 where
     T: Clone,
+    E: Send + Debug,
 {
     /// Create a new Group to do work with.
-    pub fn new() -> Group<T> {
+    pub fn new() -> Group<T, E> {
         Group {
             m: Mutex::new(HashMap::new()),
+            _marker: PhantomData,
         }
     }
 
@@ -96,8 +99,8 @@ where
     pub async fn work(
         &self,
         key: &str,
-        fut: impl Future<Output = Result<T>>,
-    ) -> (Option<T>, Option<anyhow::Error>, bool) {
+        fut: impl Future<Output = Result<T, E>>,
+    ) -> (Option<T>, Option<E>, bool) {
         // grab lock
         let mut m = self.m.lock().await;
 
