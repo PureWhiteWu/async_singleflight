@@ -9,19 +9,18 @@
 //! use std::sync::Arc;
 //! use std::time::Duration;
 //!
-//! use anyhow::Result;
 //! use async_singleflight::Group;
 //!
 //! const RES: usize = 7;
 //!
-//! async fn expensive_fn() -> Result<usize> {
+//! async fn expensive_fn() -> Result<usize, ()> {
 //!     tokio::time::sleep(Duration::new(1, 500)).await;
 //!     Ok(RES)
 //! }
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let g = Arc::new(Group::new());
+//!     let g = Arc::new(Group::<_, ()>::new());
 //!     let mut handlers = Vec::new();
 //!     for _ in 0..10 {
 //!         let g = g.clone();
@@ -37,10 +36,10 @@
 //! ```
 //!
 
-use std::future::Future;
+use std::fmt::Debug;
 use std::sync::Arc;
+use std::{future::Future, marker::PhantomData};
 
-use anyhow::Result;
 use hashbrown::HashMap;
 use tokio::sync::{Mutex, Notify};
 
@@ -70,21 +69,24 @@ where
 /// Group represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
 #[derive(Default)]
-pub struct Group<T>
+pub struct Group<T, E>
 where
     T: Clone,
 {
     m: Mutex<HashMap<String, Arc<Call<T>>>>,
+    _marker: PhantomData<fn(E)>,
 }
 
-impl<T> Group<T>
+impl<T, E> Group<T, E>
 where
     T: Clone,
+    E: Send + Debug,
 {
     /// Create a new Group to do work with.
-    pub fn new() -> Group<T> {
+    pub fn new() -> Group<T, E> {
         Group {
             m: Mutex::new(HashMap::new()),
+            _marker: PhantomData,
         }
     }
 
@@ -96,8 +98,8 @@ where
     pub async fn work(
         &self,
         key: &str,
-        fut: impl Future<Output = Result<T>>,
-    ) -> (Option<T>, Option<anyhow::Error>, bool) {
+        fut: impl Future<Output = Result<T, E>>,
+    ) -> (Option<T>, Option<E>, bool) {
         // grab lock
         let mut m = self.m.lock().await;
 
@@ -141,11 +143,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::Group;
-    use anyhow::Result;
 
     const RES: usize = 7;
 
-    async fn return_res() -> Result<usize> {
+    async fn return_res() -> Result<usize, ()> {
         Ok(7)
     }
 
@@ -163,7 +164,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
 
-        async fn expensive_fn() -> Result<usize> {
+        async fn expensive_fn() -> Result<usize, ()> {
             tokio::time::sleep(Duration::new(1, 500)).await;
             Ok(RES)
         }
