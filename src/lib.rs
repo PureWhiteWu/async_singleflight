@@ -142,12 +142,19 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::Group;
 
     const RES: usize = 7;
 
     async fn return_res() -> Result<usize, ()> {
         Ok(7)
+    }
+
+    async fn expensive_fn() -> Result<usize, ()> {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        Ok(RES)
     }
 
     #[tokio::test]
@@ -162,12 +169,6 @@ mod tests {
     async fn test_multiple_threads() {
         use futures::future::join_all;
         use std::sync::Arc;
-        use std::time::Duration;
-
-        async fn expensive_fn() -> Result<usize, ()> {
-            tokio::time::sleep(Duration::new(1, 500)).await;
-            Ok(RES)
-        }
 
         let g = Arc::new(Group::new());
         let mut handlers = Vec::new();
@@ -181,5 +182,22 @@ mod tests {
         }
 
         join_all(handlers).await;
+    }
+
+    #[tokio::test]
+    async fn test_drop_leader() {
+        use std::time::Duration;
+
+        let g = Group::new();
+        {
+            tokio::time::timeout(Duration::from_millis(50), g.work("key", expensive_fn()))
+                .await
+                .expect_err("owner should be running and cancelled");
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), g.work("key", expensive_fn())).await,
+            Ok((None, None, false)),
+            "following should be returned in time"
+        );
     }
 }
