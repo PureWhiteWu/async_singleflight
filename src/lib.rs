@@ -36,35 +36,14 @@
 //! ```
 //!
 
-use std::fmt::Debug;
-use std::sync::Arc;
-use std::{future::Future, marker::PhantomData};
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use hashbrown::HashMap;
-use tokio::sync::{Mutex, Notify};
-
-// Call is an in-flight or completed call to work.
-#[derive(Clone)]
-struct Call<T>
-where
-    T: Clone,
-{
-    nt: Arc<Notify>,
-    // TODO: how to share res through threads without lock?
-    res: Arc<parking_lot::RwLock<Option<T>>>,
-}
-
-impl<T> Call<T>
-where
-    T: Clone,
-{
-    fn new() -> Call<T> {
-        Call {
-            nt: Arc::new(Notify::new()),
-            res: Arc::new(parking_lot::RwLock::new(None)),
-        }
-    }
-}
+use parking_lot::Mutex;
+use tokio::sync::watch;
 
 /// Group represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
@@ -73,18 +52,25 @@ pub struct Group<T, E>
 where
     T: Clone,
 {
-    m: Mutex<HashMap<String, Arc<Call<T>>>>,
+    m: Mutex<HashMap<String, watch::Receiver<State<T>>>>,
     _marker: PhantomData<fn(E)>,
+}
+
+#[derive(Clone)]
+enum State<T: Clone> {
+    Starting,
+    LeaderDropped,
+    Done(Option<T>),
 }
 
 impl<T, E> Group<T, E>
 where
     T: Clone,
-    E: Send + Debug,
 {
     /// Create a new Group to do work with.
+    #[must_use]
     pub fn new() -> Group<T, E> {
-        Group {
+        Self {
             m: Mutex::new(HashMap::new()),
             _marker: PhantomData,
         }
@@ -100,43 +86,85 @@ where
         key: &str,
         fut: impl Future<Output = Result<T, E>>,
     ) -> (Option<T>, Option<E>, bool) {
-        // grab lock
-        let mut m = self.m.lock().await;
+        use hashbrown::hash_map::EntryRef;
 
-        // key already exists
-        if let Some(c) = m.get(key) {
-            let c = c.clone();
-            // need to create Notify first before drop lock
-            let nt = c.nt.notified();
-            drop(m);
-            // wait for notify
-            nt.await;
-            let res = c.res.read();
-            return (res.clone(), None, false);
+        let tx_or_rx = match self.m.lock().entry_ref(key) {
+            EntryRef::Occupied(entry) => {
+                let rx = entry.get();
+                Err(rx.clone())
+            }
+            EntryRef::Vacant(entry) => {
+                let (tx, rx) = watch::channel(State::Starting);
+                entry.insert(rx);
+                Ok(tx)
+            }
+        };
+
+        match tx_or_rx {
+            Ok(tx) => {
+                let fut = Leader { fut, tx };
+                let result = fut.await;
+                self.m.lock().remove(key);
+                match result {
+                    Ok(val) => (Some(val), None, true),
+                    Err(err) => (None, Some(err), true),
+                }
+            }
+            Err(mut rx) => {
+                let mut state = rx.borrow_and_update().clone();
+                if matches!(state, State::Starting) {
+                    let _changed = rx.changed().await;
+                    state = rx.borrow().clone();
+                }
+                match state {
+                    State::Starting => (None, None, false), // unreachable
+                    State::LeaderDropped => {
+                        self.m.lock().remove(key);
+                        (None, None, false)
+                    }
+                    State::Done(val) => (val, None, false),
+                }
+            }
         }
+    }
+}
 
-        // insert call into map and start call
-        let c = Arc::new(Call::new());
-        m.insert(key.to_owned(), c);
-        drop(m);
-        let res = fut.await;
+struct Leader<T: Clone, F> {
+    fut: F,
+    tx: watch::Sender<State<T>>,
+}
 
-        // grab lock before set result and notify waiters
-        let mut m = self.m.lock().await;
-        let c = m.get(key).unwrap();
-        if res.is_ok() {
-            let mut m2 = c.res.write();
-            *m2 = Some(res.as_ref().unwrap().clone());
-            drop(m2);
+impl<T, E, F> Future for Leader<T, F>
+where
+    T: Clone,
+    F: Future<Output = Result<T, E>>,
+{
+    type Output = Result<T, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { Pin::get_unchecked_mut(self) };
+        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
+        let result = fut.poll(cx);
+        if let Poll::Ready(val) = &result {
+            let _send = this.tx.send(State::Done(val.as_ref().ok().cloned()));
         }
-        c.nt.notify_waiters();
-        m.remove(key).unwrap();
-        drop(m);
+        result
+    }
+}
 
-        if res.is_ok() {
-            return (Some(res.unwrap()), None, true);
-        }
-        (None, Some(res.err().unwrap()), true)
+impl<T, F> Drop for Leader<T, F>
+where
+    T: Clone,
+{
+    fn drop(&mut self) {
+        let _ = self.tx.send_if_modified(|s| {
+            if matches!(s, State::Starting) {
+                *s = State::LeaderDropped;
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 
@@ -167,8 +195,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_threads() {
-        use futures::future::join_all;
         use std::sync::Arc;
+
+        use futures::future::join_all;
 
         let g = Arc::new(Group::new());
         let mut handlers = Vec::new();
