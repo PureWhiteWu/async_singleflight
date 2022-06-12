@@ -36,6 +36,7 @@
 //! ```
 //!
 
+use std::fmt::{self, Debug};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -47,13 +48,30 @@ use tokio::sync::watch;
 
 /// Group represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
-#[derive(Default)]
 pub struct Group<T, E>
 where
     T: Clone,
 {
     m: Mutex<HashMap<String, watch::Receiver<State<T>>>>,
     _marker: PhantomData<fn(E)>,
+}
+
+impl<T, E> Debug for Group<T, E>
+where
+    T: Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Group").finish()
+    }
+}
+
+impl<T, E> Default for Group<T, E>
+where
+    T: Clone,
+{
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone)]
