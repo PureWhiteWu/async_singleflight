@@ -107,9 +107,18 @@ where
         use hashbrown::hash_map::EntryRef;
 
         let tx_or_rx = match self.m.lock().entry_ref(key) {
-            EntryRef::Occupied(entry) => {
-                let rx = entry.get();
-                Err(rx.clone())
+            EntryRef::Occupied(mut entry) => {
+                let state = entry.get().borrow().clone();
+                match state {
+                    State::Starting => Err(entry.get().clone()),
+                    State::LeaderDropped => {
+                        // switch into leader if leader dropped
+                        let (tx, rx) = watch::channel(State::Starting);
+                        entry.insert(rx);
+                        Ok(tx)
+                    }
+                    State::Done(val) => return (val, None, false),
+                }
             }
             EntryRef::Vacant(entry) => {
                 let (tx, rx) = watch::channel(State::Starting);
@@ -243,8 +252,7 @@ mod tests {
         }
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), g.work("key", expensive_fn())).await,
-            Ok((None, None, false)),
-            "following should be returned in time"
+            Ok((Some(RES), None, true)),
         );
     }
 }
