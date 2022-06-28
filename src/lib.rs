@@ -44,6 +44,7 @@ use std::task::{Context, Poll};
 
 use hashbrown::HashMap;
 use parking_lot::Mutex;
+use pin_project::{pin_project, pinned_drop};
 use tokio::sync::watch;
 
 /// Group represents a class of work and creates a space in which units of work
@@ -156,7 +157,9 @@ where
     }
 }
 
+#[pin_project(PinnedDrop)]
 struct Leader<T: Clone, F> {
+    #[pin]
     fut: F,
     tx: watch::Sender<State<T>>,
 }
@@ -169,9 +172,8 @@ where
     type Output = Result<T, E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { Pin::get_unchecked_mut(self) };
-        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
-        let result = fut.poll(cx);
+        let this = self.project();
+        let result = this.fut.poll(cx);
         if let Poll::Ready(val) = &result {
             let _send = this.tx.send(State::Done(val.as_ref().ok().cloned()));
         }
@@ -179,12 +181,14 @@ where
     }
 }
 
-impl<T, F> Drop for Leader<T, F>
+#[pinned_drop]
+impl<T, F> PinnedDrop for Leader<T, F>
 where
     T: Clone,
 {
-    fn drop(&mut self) {
-        let _ = self.tx.send_if_modified(|s| {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        let _ = this.tx.send_if_modified(|s| {
             if matches!(s, State::Starting) {
                 *s = State::LeaderDropped;
                 true
