@@ -199,6 +199,155 @@ where
     }
 }
 
+/// UnaryGroup represents a class of work and creates a space in which units of work
+/// can be executed with duplicate suppression.
+pub struct UnaryGroup<T>
+where
+    T: Clone,
+{
+    m: Mutex<HashMap<String, watch::Receiver<UnaryState<T>>>>,
+}
+
+impl<T> Debug for UnaryGroup<T>
+where
+    T: Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnaryGroup").finish()
+    }
+}
+
+impl<T> Default for UnaryGroup<T>
+where
+    T: Clone + Send + Sync,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone)]
+enum UnaryState<T: Clone> {
+    Starting,
+    LeaderDropped,
+    Done(T),
+}
+
+impl<T> UnaryGroup<T>
+where
+    T: Clone + Send + Sync,
+{
+    /// Create a new Group to do work with.
+    #[must_use]
+    pub fn new() -> UnaryGroup<T> {
+        Self {
+            m: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Execute and return the value for a given function, making sure that only one
+    /// operation is in-flight at a given moment. If a duplicate call comes in, that caller will
+    /// wait until the original call completes and return the same value.
+    ///
+    /// The third return value indicates whether the call is the owner.
+    #[async_recursion::async_recursion]
+    pub async fn work(
+        &self,
+        key: &str,
+        fut: impl Future<Output = T> + Send + 'static,
+    ) -> (T, bool) {
+        use hashbrown::hash_map::EntryRef;
+
+        let tx_or_rx = match self.m.lock().entry_ref(key) {
+            EntryRef::Occupied(mut entry) => {
+                let state = entry.get().borrow().clone();
+                match state {
+                    UnaryState::Starting => Err(entry.get().clone()),
+                    UnaryState::LeaderDropped => {
+                        // switch into leader if leader dropped
+                        let (tx, rx) = watch::channel(UnaryState::Starting);
+                        entry.insert(rx);
+                        Ok(tx)
+                    }
+                    UnaryState::Done(val) => return (val, false),
+                }
+            }
+            EntryRef::Vacant(entry) => {
+                let (tx, rx) = watch::channel(UnaryState::Starting);
+                entry.insert(rx);
+                Ok(tx)
+            }
+        };
+
+        match tx_or_rx {
+            Ok(tx) => {
+                let fut = UnaryLeader { fut, tx };
+                let result = fut.await;
+                self.m.lock().remove(key);
+                (result, true)
+            }
+            Err(mut rx) => {
+                let mut state = rx.borrow_and_update().clone();
+                if matches!(state, UnaryState::Starting) {
+                    let _changed = rx.changed().await;
+                    state = rx.borrow().clone();
+                }
+                match state {
+                    UnaryState::Starting => unreachable!(), // unreachable
+                    UnaryState::LeaderDropped => {
+                        self.m.lock().remove(key);
+                        // the leader dropped, so we need to retry
+                        self.work(key, fut).await
+                    }
+                    UnaryState::Done(val) => (val, false),
+                }
+            }
+        }
+    }
+}
+
+#[pin_project(PinnedDrop)]
+struct UnaryLeader<T: Clone, F> {
+    #[pin]
+    fut: F,
+    tx: watch::Sender<UnaryState<T>>,
+}
+
+impl<T, F> Future for UnaryLeader<T, F>
+where
+    T: Clone + Send + Sync,
+    F: Future<Output = T>,
+{
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let result = this.fut.poll(cx);
+        if let Poll::Ready(val) = &result {
+            let _send = this.tx.send(UnaryState::Done(val.clone()));
+        }
+        result
+    }
+}
+
+#[pinned_drop]
+impl<T, F> PinnedDrop for UnaryLeader<T, F>
+where
+    T: Clone,
+{
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        let _ = this.tx.send_if_modified(|s| {
+            if matches!(s, UnaryState::Starting) {
+                *s = UnaryState::LeaderDropped;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
