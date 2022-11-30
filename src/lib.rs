@@ -42,6 +42,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use futures::future::BoxFuture;
 use hashbrown::HashMap;
 use parking_lot::Mutex;
 use pin_project::{pin_project, pinned_drop};
@@ -250,59 +251,59 @@ where
     /// wait until the original call completes and return the same value.
     ///
     /// The third return value indicates whether the call is the owner.
-    #[async_recursion::async_recursion]
-    pub async fn work(
-        &self,
-        key: &str,
-        fut: impl Future<Output = T> + Send + 'static,
-    ) -> (T, bool) {
+    pub fn work<'s>(
+        &'s self,
+        key: &'s str,
+        fut: impl Future<Output = T> + Send + 's,
+    ) -> BoxFuture<'s, (T, bool)> {
         use hashbrown::hash_map::EntryRef;
-
-        let tx_or_rx = match self.m.lock().entry_ref(key) {
-            EntryRef::Occupied(mut entry) => {
-                let state = entry.get().borrow().clone();
-                match state {
-                    UnaryState::Starting => Err(entry.get().clone()),
-                    UnaryState::LeaderDropped => {
-                        // switch into leader if leader dropped
-                        let (tx, rx) = watch::channel(UnaryState::Starting);
-                        entry.insert(rx);
-                        Ok(tx)
+        Box::pin(async move {
+            let tx_or_rx = match self.m.lock().entry_ref(key) {
+                EntryRef::Occupied(mut entry) => {
+                    let state = entry.get().borrow().clone();
+                    match state {
+                        UnaryState::Starting => Err(entry.get().clone()),
+                        UnaryState::LeaderDropped => {
+                            // switch into leader if leader dropped
+                            let (tx, rx) = watch::channel(UnaryState::Starting);
+                            entry.insert(rx);
+                            Ok(tx)
+                        }
+                        UnaryState::Done(val) => return (val, false),
                     }
-                    UnaryState::Done(val) => return (val, false),
                 }
-            }
-            EntryRef::Vacant(entry) => {
-                let (tx, rx) = watch::channel(UnaryState::Starting);
-                entry.insert(rx);
-                Ok(tx)
-            }
-        };
+                EntryRef::Vacant(entry) => {
+                    let (tx, rx) = watch::channel(UnaryState::Starting);
+                    entry.insert(rx);
+                    Ok(tx)
+                }
+            };
 
-        match tx_or_rx {
-            Ok(tx) => {
-                let fut = UnaryLeader { fut, tx };
-                let result = fut.await;
-                self.m.lock().remove(key);
-                (result, true)
-            }
-            Err(mut rx) => {
-                let mut state = rx.borrow_and_update().clone();
-                if matches!(state, UnaryState::Starting) {
-                    let _changed = rx.changed().await;
-                    state = rx.borrow().clone();
+            match tx_or_rx {
+                Ok(tx) => {
+                    let fut = UnaryLeader { fut, tx };
+                    let result = fut.await;
+                    self.m.lock().remove(key);
+                    (result, true)
                 }
-                match state {
-                    UnaryState::Starting => unreachable!(), // unreachable
-                    UnaryState::LeaderDropped => {
-                        self.m.lock().remove(key);
-                        // the leader dropped, so we need to retry
-                        self.work(key, fut).await
+                Err(mut rx) => {
+                    let mut state = rx.borrow_and_update().clone();
+                    if matches!(state, UnaryState::Starting) {
+                        let _changed = rx.changed().await;
+                        state = rx.borrow().clone();
                     }
-                    UnaryState::Done(val) => (val, false),
+                    match state {
+                        UnaryState::Starting => unreachable!(), // unreachable
+                        UnaryState::LeaderDropped => {
+                            self.m.lock().remove(key);
+                            // the leader dropped, so we need to retry
+                            self.work(key, fut).await
+                        }
+                        UnaryState::Done(val) => (val, false),
+                    }
                 }
             }
-        }
+        })
     }
 }
 
