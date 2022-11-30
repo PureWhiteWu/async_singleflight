@@ -1,6 +1,6 @@
 [package]
 name = "async_singleflight"
-version = "0.5.1"
+version = "0.5.2"
 authors = ["Pure White <wudi@purewhite.io>"]
 edition = "2018"
 description = "Async singleflight."
@@ -12,12 +12,11 @@ categories = ["asynchronous", "concurrency", "caching"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-recursion = "1"
-hashbrown = "0.12"
+hashbrown = "0.13"
 parking_lot = "0.12"
 pin-project = "1"
 tokio = { version = "1", features = ["sync"] }
+futures = "0.3"
 
 [dev-dependencies]
-futures = "0.3"
 tokio = { version = "1", features = ["full"] }
