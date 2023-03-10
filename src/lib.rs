@@ -20,7 +20,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let g = Arc::new(Group::<_, ()>::new());
+//!     let g = Arc::new(Group::<_>::new());
 //!     let mut handlers = Vec::new();
 //!     for _ in 0..10 {
 //!         let g = g.clone();
@@ -38,7 +38,6 @@
 
 use std::fmt::{self, Debug};
 use std::future::Future;
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -50,15 +49,14 @@ use tokio::sync::watch;
 
 /// Group represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
-pub struct Group<T, E>
+pub struct Group<T>
 where
     T: Clone,
 {
     m: Mutex<HashMap<String, watch::Receiver<State<T>>>>,
-    _marker: PhantomData<fn(E)>,
 }
 
-impl<T, E> Debug for Group<T, E>
+impl<T> Debug for Group<T>
 where
     T: Clone,
 {
@@ -67,7 +65,7 @@ where
     }
 }
 
-impl<T, E> Default for Group<T, E>
+impl<T> Default for Group<T>
 where
     T: Clone,
 {
@@ -83,16 +81,15 @@ enum State<T: Clone> {
     Done(Option<T>),
 }
 
-impl<T, E> Group<T, E>
+impl<T> Group<T>
 where
     T: Clone,
 {
     /// Create a new Group to do work with.
     #[must_use]
-    pub fn new() -> Group<T, E> {
+    pub fn new() -> Group<T> {
         Self {
             m: Mutex::new(HashMap::new()),
-            _marker: PhantomData,
         }
     }
 
@@ -101,7 +98,7 @@ where
     /// wait until the original call completes and return the same value.
     /// Only owner call returns error if exists.
     /// The third return value indicates whether the call is the owner.
-    pub async fn work(
+    pub async fn work<E>(
         &self,
         key: &str,
         fut: impl Future<Output = Result<T, E>>,
