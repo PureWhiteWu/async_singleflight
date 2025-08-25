@@ -42,10 +42,10 @@ where
     }
 
     /// Execute and return the value for a given function, making sure that only one
-    /// operation is in-flight at a given moment. If a duplicate call comes in, that caller will
-    /// wait until the original call completes and return the same value.
+    /// operation is in-flight at a given moment.
     ///
-    /// The third return value indicates whether the call is the owner.
+    /// - If a duplicate call comes in, that caller will wait until the original
+    ///   call completes and return the same value.
     pub async fn work<Q, F>(&self, key: &Q, fut: F) -> T
     where
         Q: Hash + Eq + ?Sized + ToOwned<Owned = K> + Send + Sync,
