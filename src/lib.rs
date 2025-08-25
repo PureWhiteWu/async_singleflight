@@ -42,34 +42,37 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use dashmap::DashMap;
 use futures::future::BoxFuture;
-use hashbrown::HashMap;
-use parking_lot::Mutex;
 use pin_project::{pin_project, pinned_drop};
+use std::hash::Hash;
 use tokio::sync::watch;
 
 /// Group represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
-pub struct Group<T, E>
+pub struct Group<T, E, K = String>
 where
     T: Clone,
+    K: Hash + Eq,
 {
-    m: Mutex<HashMap<String, watch::Receiver<State<T>>>>,
+    map: DashMap<K, watch::Receiver<State<T>>>,
     _marker: PhantomData<fn(E)>,
 }
 
-impl<T, E> Debug for Group<T, E>
+impl<T, E, K> Debug for Group<T, E, K>
 where
     T: Clone,
+    K: Hash + Eq,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Group").finish()
     }
 }
 
-impl<T, E> Default for Group<T, E>
+impl<T, E, K> Default for Group<T, E, K>
 where
     T: Clone,
+    K: Hash + Eq,
 {
     fn default() -> Self {
         Self::new()
@@ -83,15 +86,16 @@ enum State<T: Clone> {
     Done(Option<T>),
 }
 
-impl<T, E> Group<T, E>
+impl<T, E, K> Group<T, E, K>
 where
     T: Clone,
+    K: Hash + Eq,
 {
     /// Create a new Group to do work with.
     #[must_use]
-    pub fn new() -> Group<T, E> {
+    pub fn new() -> Group<T, E, K> {
         Self {
-            m: Mutex::new(HashMap::new()),
+            map: DashMap::new(),
             _marker: PhantomData,
         }
     }
@@ -101,39 +105,39 @@ where
     /// wait until the original call completes and return the same value.
     /// Only owner call returns error if exists.
     /// The third return value indicates whether the call is the owner.
-    pub async fn work(
+    pub async fn work<Q>(
         &self,
-        key: &str,
+        key: &Q,
         fut: impl Future<Output = Result<T, E>>,
-    ) -> (Option<T>, Option<E>, bool) {
-        use hashbrown::hash_map::EntryRef;
-
-        let tx_or_rx = match self.m.lock().entry_ref(key) {
-            EntryRef::Occupied(mut entry) => {
-                let state = entry.get().borrow().clone();
-                match state {
-                    State::Starting => Err(entry.get().clone()),
-                    State::LeaderDropped => {
-                        // switch into leader if leader dropped
-                        let (tx, rx) = watch::channel(State::Starting);
-                        entry.insert(rx);
-                        Ok(tx)
-                    }
-                    State::Done(val) => return (val, None, false),
+    ) -> (Option<T>, Option<E>, bool)
+    where
+        Q: Hash + Eq + ?Sized + ToOwned<Owned = K>,
+        K: std::borrow::Borrow<Q>,
+    {
+        let tx_or_rx = if let Some(state_ref) = self.map.get(key) {
+            let state = state_ref.borrow().clone();
+            match state {
+                State::Starting => Err(state_ref.clone()),
+                State::LeaderDropped => {
+                    drop(state_ref);
+                    // switch into leader if leader dropped
+                    let (tx, rx) = watch::channel(State::Starting);
+                    self.map.insert(key.to_owned(), rx);
+                    Ok(tx)
                 }
+                State::Done(val) => return (val, None, false),
             }
-            EntryRef::Vacant(entry) => {
-                let (tx, rx) = watch::channel(State::Starting);
-                entry.insert(rx);
-                Ok(tx)
-            }
+        } else {
+            let (tx, rx) = watch::channel(State::Starting);
+            self.map.insert(key.to_owned(), rx);
+            Ok(tx)
         };
 
         match tx_or_rx {
             Ok(tx) => {
                 let fut = Leader { fut, tx };
                 let result = fut.await;
-                self.m.lock().remove(key);
+                self.map.remove(key);
                 match result {
                     Ok(val) => (Some(val), None, true),
                     Err(err) => (None, Some(err), true),
@@ -148,7 +152,7 @@ where
                 match state {
                     State::Starting => (None, None, false), // unreachable
                     State::LeaderDropped => {
-                        self.m.lock().remove(key);
+                        self.map.remove(key);
                         (None, None, false)
                     }
                     State::Done(val) => (val, None, false),
@@ -202,11 +206,12 @@ where
 
 /// UnaryGroup represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
-pub struct UnaryGroup<T>
+pub struct UnaryGroup<T, K = String>
 where
     T: Clone,
+    K: Hash + Eq,
 {
-    m: Mutex<HashMap<String, watch::Receiver<UnaryState<T>>>>,
+    map: DashMap<K, watch::Receiver<UnaryState<T>>>,
 }
 
 impl<T> Debug for UnaryGroup<T>
@@ -234,15 +239,16 @@ enum UnaryState<T: Clone> {
     Done(T),
 }
 
-impl<T> UnaryGroup<T>
+impl<T, K> UnaryGroup<T, K>
 where
     T: Clone + Send + Sync,
+    K: Hash + Eq + Send + Sync,
 {
     /// Create a new Group to do work with.
     #[must_use]
-    pub fn new() -> UnaryGroup<T> {
+    pub fn new() -> UnaryGroup<T, K> {
         Self {
-            m: Mutex::new(HashMap::new()),
+            map: DashMap::new(),
         }
     }
 
@@ -251,39 +257,40 @@ where
     /// wait until the original call completes and return the same value.
     ///
     /// The third return value indicates whether the call is the owner.
-    pub fn work<'s>(
+    pub fn work<'s, Q>(
         &'s self,
-        key: &'s str,
+        key: &'s Q,
         fut: impl Future<Output = T> + Send + 's,
-    ) -> BoxFuture<'s, (T, bool)> {
-        use hashbrown::hash_map::EntryRef;
+    ) -> BoxFuture<'s, (T, bool)>
+    where
+        Q: Hash + Eq + ?Sized + ToOwned<Owned = K> + Send + Sync,
+        K: std::borrow::Borrow<Q>,
+    {
         Box::pin(async move {
-            let tx_or_rx = match self.m.lock().entry_ref(key) {
-                EntryRef::Occupied(mut entry) => {
-                    let state = entry.get().borrow().clone();
-                    match state {
-                        UnaryState::Starting => Err(entry.get().clone()),
-                        UnaryState::LeaderDropped => {
-                            // switch into leader if leader dropped
-                            let (tx, rx) = watch::channel(UnaryState::Starting);
-                            entry.insert(rx);
-                            Ok(tx)
-                        }
-                        UnaryState::Done(val) => return (val, false),
+            let tx_or_rx = if let Some(state_ref) = self.map.get(key) {
+                let state = state_ref.borrow().clone();
+                match state {
+                    UnaryState::Starting => Err(state_ref.clone()),
+                    UnaryState::LeaderDropped => {
+                        drop(state_ref);
+                        // switch into leader if leader dropped
+                        let (tx, rx) = watch::channel(UnaryState::Starting);
+                        self.map.insert(key.to_owned(), rx);
+                        Ok(tx)
                     }
+                    UnaryState::Done(val) => return (val, false),
                 }
-                EntryRef::Vacant(entry) => {
-                    let (tx, rx) = watch::channel(UnaryState::Starting);
-                    entry.insert(rx);
-                    Ok(tx)
-                }
+            } else {
+                let (tx, rx) = watch::channel(UnaryState::Starting);
+                self.map.insert(key.to_owned(), rx);
+                Ok(tx)
             };
 
             match tx_or_rx {
                 Ok(tx) => {
                     let fut = UnaryLeader { fut, tx };
                     let result = fut.await;
-                    self.m.lock().remove(key);
+                    self.map.remove(key);
                     (result, true)
                 }
                 Err(mut rx) => {
@@ -295,7 +302,7 @@ where
                     match state {
                         UnaryState::Starting => unreachable!(), // unreachable
                         UnaryState::LeaderDropped => {
-                            self.m.lock().remove(key);
+                            self.map.remove(key);
                             // the leader dropped, so we need to retry
                             self.work(key, fut).await
                         }
@@ -386,6 +393,26 @@ mod tests {
             let g = g.clone();
             handlers.push(tokio::spawn(async move {
                 let res = g.work("key", expensive_fn()).await.0;
+                let r = res.unwrap();
+                println!("{}", r);
+            }));
+        }
+
+        join_all(handlers).await;
+    }
+
+    #[tokio::test]
+    async fn test_multiple_threads_custom_type() {
+        use std::sync::Arc;
+
+        use futures::future::join_all;
+
+        let g = Arc::new(Group::<_, _, u64>::new());
+        let mut handlers = Vec::new();
+        for _ in 0..10 {
+            let g = g.clone();
+            handlers.push(tokio::spawn(async move {
+                let res = g.work(&42, expensive_fn()).await.0;
                 let r = res.unwrap();
                 println!("{}", r);
             }));
