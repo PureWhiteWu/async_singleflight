@@ -145,19 +145,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::oneshot;
 
     async fn return_res() -> Result<usize, ()> {
         Ok(7)
     }
 
-    async fn expensive_fn<const RES: usize>() -> Result<usize, ()> {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    async fn expensive_fn<const RES: usize>(delay: u64) -> Result<usize, ()> {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
         Ok(RES)
     }
 
-    async fn expensive_unary_fn<const RES: usize>() -> usize {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    async fn expensive_unary_fn<const RES: usize>(delay: u64) -> usize {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
         RES
     }
 
@@ -180,7 +182,7 @@ mod tests {
         for _ in 0..10 {
             let g = g.clone();
             handlers.push(tokio::spawn(async move {
-                let res = g.work("key", expensive_fn::<7>()).await;
+                let res = g.work("key", expensive_fn::<7>(300)).await;
                 let r = res.unwrap();
                 println!("{}", r);
             }));
@@ -200,7 +202,7 @@ mod tests {
         for _ in 0..10 {
             let g = g.clone();
             handlers.push(tokio::spawn(async move {
-                let res = g.work(&42, expensive_fn::<8>()).await;
+                let res = g.work(&42, expensive_fn::<8>(300)).await;
                 let r = res.unwrap();
                 println!("{}", r);
             }));
@@ -220,7 +222,7 @@ mod tests {
         for _ in 0..10 {
             let g = g.clone();
             handlers.push(tokio::spawn(async move {
-                let res = g.work(&42, expensive_unary_fn::<8>()).await;
+                let res = g.work(&42, expensive_unary_fn::<8>(300)).await;
                 assert_eq!(res, 8);
             }));
         }
@@ -230,20 +232,91 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_leader() {
-        use std::time::Duration;
+        let group = Arc::new(Group::new());
 
-        let g = Group::new();
-        {
-            tokio::time::timeout(
-                Duration::from_millis(50),
-                g.work("key", expensive_fn::<2>()),
-            )
+        // Signal when the leader's inner future gets polled (implies map entry inserted).
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+
+        let leader_owned = group.clone();
+        let leader = tokio::spawn(async move {
+            // The inner future signals on first poll, then sleeps long.
+            let fut = async move {
+                let _ = ready_tx.send(());
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok::<usize, ()>(7)
+            };
+            // We expect this task to be aborted before completion.
+            let _ = leader_owned.work("key", fut).await;
+        });
+
+        // Wait until the leader's future has been polled once (map entry is in place).
+        let _ = ready_rx.await;
+
+        // Spawn a follower that will wait on the existing key and should observe LeaderDropped.
+        let follower_owned = group.clone();
+        let follower = tokio::spawn(async move {
+            follower_owned
+                .work("key", async { Ok::<usize, ()>(42) })
+                .await
+        });
+
+        // Give the follower a chance to attach to the receiver.
+        tokio::task::yield_now().await;
+
+        // Abort the leader to trigger LeaderDropped notification to all followers.
+        leader.abort();
+
+        // The follower should return LeaderDropped.
+        let res = tokio::time::timeout(Duration::from_secs(1), follower)
             .await
-            .expect_err("owner should be running and cancelled");
-        }
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), g.work("key", expensive_fn::<7>())).await,
-            Ok(Ok(7))
-        );
+            .expect("follower should finish in time")
+            .expect("follower task should not panic");
+
+        assert_eq!(res, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn test_drop_leader_no_retry() {
+        let group = Arc::new(Group::new());
+
+        // Signal when the leader's inner future gets polled (implies map entry inserted).
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+
+        let leader_owned = group.clone();
+        let leader = tokio::spawn(async move {
+            // The inner future signals on first poll, then sleeps long.
+            let fut = async move {
+                let _ = ready_tx.send(());
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok::<usize, ()>(7)
+            };
+            // We expect this task to be aborted before completion.
+            let _ = leader_owned.work("key", fut).await;
+        });
+
+        // Wait until the leader's future has been polled once (map entry is in place).
+        let _ = ready_rx.await;
+
+        // Spawn a follower that will wait on the existing key and should observe LeaderDropped.
+        let follower_owned = group.clone();
+        let follower = tokio::spawn(async move {
+            follower_owned
+                .work_no_retry("key", async { Ok::<usize, ()>(42) })
+                .await
+        });
+
+        // Give the follower a chance to attach to the receiver.
+        tokio::task::yield_now().await;
+
+        // Abort the leader to trigger LeaderDropped notification to all followers.
+        leader.abort();
+
+        // The follower should return LeaderDropped.
+        let res = tokio::time::timeout(Duration::from_secs(1), follower)
+            .await
+            .expect("follower should finish in time")
+            .expect("follower task should not panic");
+
+        assert_eq!(res, Err(GroupWorkError::LeaderDropped));
     }
 }
