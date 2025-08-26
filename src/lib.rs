@@ -25,7 +25,7 @@
 //!     for _ in 0..10 {
 //!         let g = g.clone();
 //!         handlers.push(tokio::spawn(async move {
-//!             let res = g.work("key", expensive_fn()).await.0;
+//!             let res = g.work("key", expensive_fn()).await;
 //!             let r = res.unwrap();
 //!             println!("{}", r);
 //!         }));
@@ -42,148 +42,53 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures::future::BoxFuture;
-use hashbrown::HashMap;
-use parking_lot::Mutex;
+mod group;
+mod unary;
+
+pub use group::*;
+pub use unary::*;
+
+use dashmap::DashMap;
 use pin_project::{pin_project, pinned_drop};
+use std::hash::Hash;
 use tokio::sync::watch;
-
-/// Group represents a class of work and creates a space in which units of work
-/// can be executed with duplicate suppression.
-pub struct Group<T, E>
-where
-    T: Clone,
-{
-    m: Mutex<HashMap<String, watch::Receiver<State<T>>>>,
-    _marker: PhantomData<fn(E)>,
-}
-
-impl<T, E> Debug for Group<T, E>
-where
-    T: Clone,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Group").finish()
-    }
-}
-
-impl<T, E> Default for Group<T, E>
-where
-    T: Clone,
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[derive(Clone)]
 enum State<T: Clone> {
     Starting,
     LeaderDropped,
-    Done(Option<T>),
+    LeaderFailed,
+    Success(T),
 }
 
-impl<T, E> Group<T, E>
-where
-    T: Clone,
-{
-    /// Create a new Group to do work with.
-    #[must_use]
-    pub fn new() -> Group<T, E> {
-        Self {
-            m: Mutex::new(HashMap::new()),
-            _marker: PhantomData,
-        }
-    }
-
-    /// Execute and return the value for a given function, making sure that only one
-    /// operation is in-flight at a given moment. If a duplicate call comes in, that caller will
-    /// wait until the original call completes and return the same value.
-    /// Only owner call returns error if exists.
-    /// The third return value indicates whether the call is the owner.
-    pub async fn work(
-        &self,
-        key: &str,
-        fut: impl Future<Output = Result<T, E>>,
-    ) -> (Option<T>, Option<E>, bool) {
-        use hashbrown::hash_map::EntryRef;
-
-        let tx_or_rx = match self.m.lock().entry_ref(key) {
-            EntryRef::Occupied(mut entry) => {
-                let state = entry.get().borrow().clone();
-                match state {
-                    State::Starting => Err(entry.get().clone()),
-                    State::LeaderDropped => {
-                        // switch into leader if leader dropped
-                        let (tx, rx) = watch::channel(State::Starting);
-                        entry.insert(rx);
-                        Ok(tx)
-                    }
-                    State::Done(val) => return (val, None, false),
-                }
-            }
-            EntryRef::Vacant(entry) => {
-                let (tx, rx) = watch::channel(State::Starting);
-                entry.insert(rx);
-                Ok(tx)
-            }
-        };
-
-        match tx_or_rx {
-            Ok(tx) => {
-                let fut = Leader { fut, tx };
-                let result = fut.await;
-                self.m.lock().remove(key);
-                match result {
-                    Ok(val) => (Some(val), None, true),
-                    Err(err) => (None, Some(err), true),
-                }
-            }
-            Err(mut rx) => {
-                let mut state = rx.borrow_and_update().clone();
-                if matches!(state, State::Starting) {
-                    let _changed = rx.changed().await;
-                    state = rx.borrow().clone();
-                }
-                match state {
-                    State::Starting => (None, None, false), // unreachable
-                    State::LeaderDropped => {
-                        self.m.lock().remove(key);
-                        (None, None, false)
-                    }
-                    State::Done(val) => (val, None, false),
-                }
-            }
-        }
-    }
+enum ChannelHandler<T: Clone> {
+    Sender(watch::Sender<State<T>>),
+    Receiver(watch::Receiver<State<T>>),
 }
 
 #[pin_project(PinnedDrop)]
-struct Leader<T: Clone, F> {
+struct Leader<T: Clone, F, Output> {
     #[pin]
     fut: F,
     tx: watch::Sender<State<T>>,
+    _marker: PhantomData<Output>,
 }
 
-impl<T, E, F> Future for Leader<T, F>
+impl<T, F, Output> Leader<T, F, Output>
 where
     T: Clone,
-    F: Future<Output = Result<T, E>>,
 {
-    type Output = Result<T, E>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let result = this.fut.poll(cx);
-        if let Poll::Ready(val) = &result {
-            let _send = this.tx.send(State::Done(val.as_ref().ok().cloned()));
+    fn new(fut: F, tx: watch::Sender<State<T>>) -> Self {
+        Self {
+            fut,
+            tx,
+            _marker: PhantomData,
         }
-        result
     }
 }
 
 #[pinned_drop]
-impl<T, F> PinnedDrop for Leader<T, F>
+impl<T, F, Output> PinnedDrop for Leader<T, F, Output>
 where
     T: Clone,
 {
@@ -200,121 +105,27 @@ where
     }
 }
 
-/// UnaryGroup represents a class of work and creates a space in which units of work
-/// can be executed with duplicate suppression.
-pub struct UnaryGroup<T>
+impl<T, E, F> Future for Leader<T, F, Result<T, E>>
 where
     T: Clone,
+    F: Future<Output = Result<T, E>>,
 {
-    m: Mutex<HashMap<String, watch::Receiver<UnaryState<T>>>>,
-}
+    type Output = Result<T, E>;
 
-impl<T> Debug for UnaryGroup<T>
-where
-    T: Clone,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UnaryGroup").finish()
-    }
-}
-
-impl<T> Default for UnaryGroup<T>
-where
-    T: Clone + Send + Sync,
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Clone)]
-enum UnaryState<T: Clone> {
-    Starting,
-    LeaderDropped,
-    Done(T),
-}
-
-impl<T> UnaryGroup<T>
-where
-    T: Clone + Send + Sync,
-{
-    /// Create a new Group to do work with.
-    #[must_use]
-    pub fn new() -> UnaryGroup<T> {
-        Self {
-            m: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Execute and return the value for a given function, making sure that only one
-    /// operation is in-flight at a given moment. If a duplicate call comes in, that caller will
-    /// wait until the original call completes and return the same value.
-    ///
-    /// The third return value indicates whether the call is the owner.
-    pub fn work<'s>(
-        &'s self,
-        key: &'s str,
-        fut: impl Future<Output = T> + Send + 's,
-    ) -> BoxFuture<'s, (T, bool)> {
-        use hashbrown::hash_map::EntryRef;
-        Box::pin(async move {
-            let tx_or_rx = match self.m.lock().entry_ref(key) {
-                EntryRef::Occupied(mut entry) => {
-                    let state = entry.get().borrow().clone();
-                    match state {
-                        UnaryState::Starting => Err(entry.get().clone()),
-                        UnaryState::LeaderDropped => {
-                            // switch into leader if leader dropped
-                            let (tx, rx) = watch::channel(UnaryState::Starting);
-                            entry.insert(rx);
-                            Ok(tx)
-                        }
-                        UnaryState::Done(val) => return (val, false),
-                    }
-                }
-                EntryRef::Vacant(entry) => {
-                    let (tx, rx) = watch::channel(UnaryState::Starting);
-                    entry.insert(rx);
-                    Ok(tx)
-                }
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let result = this.fut.poll(cx);
+        if let Poll::Ready(val) = &result {
+            let _send = match val {
+                Ok(v) => this.tx.send(State::Success(v.clone())),
+                Err(_) => this.tx.send(State::LeaderFailed),
             };
-
-            match tx_or_rx {
-                Ok(tx) => {
-                    let fut = UnaryLeader { fut, tx };
-                    let result = fut.await;
-                    self.m.lock().remove(key);
-                    (result, true)
-                }
-                Err(mut rx) => {
-                    let mut state = rx.borrow_and_update().clone();
-                    if matches!(state, UnaryState::Starting) {
-                        let _changed = rx.changed().await;
-                        state = rx.borrow().clone();
-                    }
-                    match state {
-                        UnaryState::Starting => unreachable!(), // unreachable
-                        UnaryState::LeaderDropped => {
-                            self.m.lock().remove(key);
-                            // the leader dropped, so we need to retry
-                            self.work(key, fut).await
-                        }
-                        UnaryState::Done(val) => (val, false),
-                    }
-                }
-            }
-        })
+        }
+        result
     }
 }
 
-#[pin_project(PinnedDrop)]
-struct UnaryLeader<T: Clone, F> {
-    #[pin]
-    fut: F,
-    tx: watch::Sender<UnaryState<T>>,
-}
-
-impl<T, F> Future for UnaryLeader<T, F>
+impl<T, F> Future for Leader<T, F, T>
 where
     T: Clone + Send + Sync,
     F: Future<Output = T>,
@@ -325,53 +136,39 @@ where
         let this = self.project();
         let result = this.fut.poll(cx);
         if let Poll::Ready(val) = &result {
-            let _send = this.tx.send(UnaryState::Done(val.clone()));
+            let _send = this.tx.send(State::Success(val.clone()));
         }
         result
     }
 }
 
-#[pinned_drop]
-impl<T, F> PinnedDrop for UnaryLeader<T, F>
-where
-    T: Clone,
-{
-    fn drop(self: Pin<&mut Self>) {
-        let this = self.project();
-        let _ = this.tx.send_if_modified(|s| {
-            if matches!(s, UnaryState::Starting) {
-                *s = UnaryState::LeaderDropped;
-                true
-            } else {
-                false
-            }
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::Arc;
     use std::time::Duration;
-
-    use super::Group;
-
-    const RES: usize = 7;
+    use tokio::sync::oneshot;
 
     async fn return_res() -> Result<usize, ()> {
         Ok(7)
     }
 
-    async fn expensive_fn() -> Result<usize, ()> {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    async fn expensive_fn<const RES: usize>(delay: u64) -> Result<usize, ()> {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
         Ok(RES)
+    }
+
+    async fn expensive_unary_fn<const RES: usize>(delay: u64) -> usize {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        RES
     }
 
     #[tokio::test]
     async fn test_simple() {
         let g = Group::new();
-        let res = g.work("key", return_res()).await.0;
+        let res = g.work("key", return_res()).await;
         let r = res.unwrap();
-        assert_eq!(r, RES);
+        assert_eq!(r, 7);
     }
 
     #[tokio::test]
@@ -381,11 +178,11 @@ mod tests {
         use futures::future::join_all;
 
         let g = Arc::new(Group::new());
-        let mut handlers = Vec::new();
+        let mut handlers = Vec::with_capacity(10);
         for _ in 0..10 {
             let g = g.clone();
             handlers.push(tokio::spawn(async move {
-                let res = g.work("key", expensive_fn()).await.0;
+                let res = g.work("key", expensive_fn::<7>(300)).await;
                 let r = res.unwrap();
                 println!("{}", r);
             }));
@@ -395,18 +192,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drop_leader() {
-        use std::time::Duration;
+    async fn test_multiple_threads_custom_type() {
+        use std::sync::Arc;
 
-        let g = Group::new();
-        {
-            tokio::time::timeout(Duration::from_millis(50), g.work("key", expensive_fn()))
-                .await
-                .expect_err("owner should be running and cancelled");
+        use futures::future::join_all;
+
+        let g = Arc::new(Group::<_, _, u64>::new());
+        let mut handlers = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let g = g.clone();
+            handlers.push(tokio::spawn(async move {
+                let res = g.work(&42, expensive_fn::<8>(300)).await;
+                let r = res.unwrap();
+                println!("{}", r);
+            }));
         }
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), g.work("key", expensive_fn())).await,
-            Ok((Some(RES), None, true)),
-        );
+
+        join_all(handlers).await;
+    }
+
+    #[tokio::test]
+    async fn test_multiple_threads_unary() {
+        use std::sync::Arc;
+
+        use futures::future::join_all;
+
+        let g = Arc::new(UnaryGroup::<_, u64>::new());
+        let mut handlers = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let g = g.clone();
+            handlers.push(tokio::spawn(async move {
+                let res = g.work(&42, expensive_unary_fn::<8>(300)).await;
+                assert_eq!(res, 8);
+            }));
+        }
+
+        join_all(handlers).await;
+    }
+
+    #[tokio::test]
+    async fn test_drop_leader() {
+        let group = Arc::new(Group::new());
+
+        // Signal when the leader's inner future gets polled (implies map entry inserted).
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+
+        let leader_owned = group.clone();
+        let leader = tokio::spawn(async move {
+            // The inner future signals on first poll, then sleeps long.
+            let fut = async move {
+                let _ = ready_tx.send(());
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok::<usize, ()>(7)
+            };
+            // We expect this task to be aborted before completion.
+            let _ = leader_owned.work("key", fut).await;
+        });
+
+        // Wait until the leader's future has been polled once (map entry is in place).
+        let _ = ready_rx.await;
+
+        // Spawn a follower that will wait on the existing key and should observe LeaderDropped.
+        let follower_owned = group.clone();
+        let follower = tokio::spawn(async move {
+            follower_owned
+                .work("key", async { Ok::<usize, ()>(42) })
+                .await
+        });
+
+        // Give the follower a chance to attach to the receiver.
+        tokio::task::yield_now().await;
+
+        // Abort the leader to trigger LeaderDropped notification to all followers.
+        leader.abort();
+
+        // The follower should return LeaderDropped.
+        let res = tokio::time::timeout(Duration::from_secs(1), follower)
+            .await
+            .expect("follower should finish in time")
+            .expect("follower task should not panic");
+
+        assert_eq!(res, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn test_drop_leader_no_retry() {
+        let group = Arc::new(Group::new());
+
+        // Signal when the leader's inner future gets polled (implies map entry inserted).
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+
+        let leader_owned = group.clone();
+        let leader = tokio::spawn(async move {
+            // The inner future signals on first poll, then sleeps long.
+            let fut = async move {
+                let _ = ready_tx.send(());
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok::<usize, ()>(7)
+            };
+            // We expect this task to be aborted before completion.
+            let _ = leader_owned.work("key", fut).await;
+        });
+
+        // Wait until the leader's future has been polled once (map entry is in place).
+        let _ = ready_rx.await;
+
+        // Spawn a follower that will wait on the existing key and should observe LeaderDropped.
+        let follower_owned = group.clone();
+        let follower = tokio::spawn(async move {
+            follower_owned
+                .work_no_retry("key", async { Ok::<usize, ()>(42) })
+                .await
+        });
+
+        // Give the follower a chance to attach to the receiver.
+        tokio::task::yield_now().await;
+
+        // Abort the leader to trigger LeaderDropped notification to all followers.
+        leader.abort();
+
+        // The follower should return LeaderDropped.
+        let res = tokio::time::timeout(Duration::from_secs(1), follower)
+            .await
+            .expect("follower should finish in time")
+            .expect("follower task should not panic");
+
+        assert_eq!(res, Err(GroupWorkError::LeaderDropped));
     }
 }
