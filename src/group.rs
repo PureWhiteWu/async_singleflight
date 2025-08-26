@@ -2,30 +2,20 @@ use super::*;
 
 /// Group represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
-pub struct Group<T, E, K = String>
-where
-    T: Clone,
-    K: Hash + Eq,
-{
-    map: DashMap<K, watch::Receiver<State<T>>>,
+pub struct Group<K, T, E> {
+    map: Mutex<HashMap<K, watch::Receiver<State<T>>>>,
     _marker: PhantomData<fn(E)>,
 }
 
-impl<T, E, K> Debug for Group<T, E, K>
-where
-    T: Clone,
-    K: Hash + Eq,
-{
+pub type DefaultGroup<T, E = ()> = Group<String, T, E>;
+
+impl<K, T, E> Debug for Group<K, T, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Group").finish()
     }
 }
 
-impl<T, E, K> Default for Group<T, E, K>
-where
-    T: Clone,
-    K: Hash + Eq,
-{
+impl<K, T, E> Default for Group<K, T, E> {
     fn default() -> Self {
         Self::new()
     }
@@ -42,76 +32,60 @@ pub enum GroupWorkError<E> {
 }
 
 impl<E> GroupWorkError<E> {
-    pub fn unwrap_err(self) -> E {
+    #[inline(always)]
+    pub fn err(self) -> Option<E> {
         match self {
-            GroupWorkError::Error(err) => err,
-            _ => panic!("called `unwrap_err` on a non-error variant"),
-        }
-    }
-
-    pub fn as_ref(&self) -> GroupWorkError<&E> {
-        match self {
-            GroupWorkError::Error(err) => GroupWorkError::Error(err),
-            GroupWorkError::LeaderFailed => GroupWorkError::LeaderFailed,
-            GroupWorkError::LeaderDropped => GroupWorkError::LeaderDropped,
-        }
-    }
-
-    pub fn into_inner(self) -> E {
-        match self {
-            GroupWorkError::Error(err) => err,
-            _ => panic!("called `into_inner` on a non-error variant"),
-        }
-    }
-}
-
-impl<E> From<GroupWorkError<E>> for Option<E> {
-    fn from(err: GroupWorkError<E>) -> Self {
-        match err {
             GroupWorkError::Error(e) => Some(e),
             _ => None,
         }
     }
 }
 
-impl<T, E, K> Group<T, E, K>
+impl<K, T, E> Group<K, T, E> {
+    /// Create a new Group to do work with.
+    #[must_use]
+    pub fn new() -> Group<K, T, E> {
+        Self {
+            map: Mutex::new(HashMap::new()),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<K, T, E> Group<K, T, E>
 where
     T: Clone,
     K: Hash + Eq,
 {
-    /// Create a new Group to do work with.
-    #[must_use]
-    pub fn new() -> Group<T, E, K> {
-        Self {
-            map: DashMap::new(),
-            _marker: PhantomData,
-        }
-    }
-
     async fn work_inner<Q, F>(&self, key: &Q, fut: &mut Option<F>) -> Result<T, GroupWorkError<E>>
     where
-        Q: Hash + Eq + ?Sized + ToOwned<Owned = K> + Send + Sync,
+        Q: Hash + Eq + ?Sized + Send + Sync + ToOwned<Owned = K>,
         F: Future<Output = Result<T, E>> + Send,
         K: std::borrow::Borrow<Q>,
     {
-        let handler = if let Some(state_ref) = self.map.get(key) {
-            let state = state_ref.borrow().clone();
-            match state {
-                State::Starting => ChannelHandler::Receiver(state_ref.clone()),
-                State::LeaderDropped => {
-                    drop(state_ref);
-                    // switch into leader if leader dropped
+        let handler = {
+            let mut locked_map = self.map.lock().await;
+            match locked_map.get_mut(key) {
+                Some(state_ref) => {
+                    let state = state_ref.borrow().clone();
+                    match state {
+                        State::Starting => ChannelHandler::Receiver(state_ref.clone()),
+                        State::LeaderDropped => {
+                            // switch into leader if leader dropped
+                            let (tx, rx) = watch::channel(State::Starting);
+                            *state_ref = rx;
+                            ChannelHandler::Sender(tx)
+                        }
+                        State::Success(val) => return Ok(val),
+                        State::LeaderFailed => return Err(GroupWorkError::LeaderFailed),
+                    }
+                }
+                None => {
                     let (tx, rx) = watch::channel(State::Starting);
-                    self.map.insert(key.to_owned(), rx);
+                    locked_map.insert(key.to_owned(), rx);
                     ChannelHandler::Sender(tx)
                 }
-                State::Success(val) => return Ok(val),
-                State::LeaderFailed => return Err(GroupWorkError::LeaderFailed),
             }
-        } else {
-            let (tx, rx) = watch::channel(State::Starting);
-            self.map.insert(key.to_owned(), rx);
-            ChannelHandler::Sender(tx)
         };
 
         match handler {
@@ -122,7 +96,7 @@ where
                     tx,
                 );
                 let result = leader.await;
-                let _ = self.map.remove(key);
+                self.map.lock().await.remove(key);
                 match result {
                     Ok(val) => Ok(val),
                     Err(err) => Err(GroupWorkError::Error(err)),
@@ -137,7 +111,7 @@ where
                 match state {
                     State::Starting => unreachable!(), // unreachable
                     State::LeaderDropped => {
-                        let _ = self.map.remove(key);
+                        self.map.lock().await.remove(key);
                         // the leader dropped
                         Err(GroupWorkError::LeaderDropped)
                     }
@@ -153,10 +127,11 @@ where
     ///
     /// - If a duplicate call comes in, that caller will wait until the original
     ///   call completes and return the same value.
-    /// - Only owner call returns error if exists.
+    /// - If the leader returns an error, owner call returns error,
+    ///   others will return `Err(None)`.
     pub async fn work<Q, F>(&self, key: &Q, fut: F) -> Result<T, Option<E>>
     where
-        Q: Hash + Eq + ?Sized + ToOwned<Owned = K> + Send + Sync,
+        Q: Hash + Eq + ?Sized + Send + Sync + ToOwned<Owned = K>,
         F: Future<Output = Result<T, E>> + Send,
         K: std::borrow::Borrow<Q>,
     {
@@ -181,11 +156,12 @@ where
     ///
     /// - If a duplicate call comes in, that caller will wait until the original
     ///   call completes and return the same value.
-    /// - Only owner call returns error if exists.
-    /// - If the leader drops, the call will return `None`.
+    /// - If the leader returns an error, owner call returns error,
+    ///   others will return `Err(GroupWorkError::LeaderFailed)`.
+    /// - If the leader drops, the call will return `Err(GroupWorkError::LeaderDropped)`.
     pub async fn work_no_retry<Q, F>(&self, key: &Q, fut: F) -> Result<T, GroupWorkError<E>>
     where
-        Q: Hash + Eq + ?Sized + ToOwned<Owned = K> + Send + Sync,
+        Q: Hash + Eq + ?Sized + Send + Sync + ToOwned<Owned = K>,
         F: Future<Output = Result<T, E>> + Send,
         K: std::borrow::Borrow<Q>,
     {
