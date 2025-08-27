@@ -2,38 +2,45 @@ use super::*;
 
 /// UnaryGroup represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
-pub struct UnaryGroup<K, T> {
-    map: Mutex<HashMap<K, watch::Receiver<State<T>>>>,
+pub struct UnaryGroup<K, T, S = RandomState> {
+    map: Mutex<HashMap<K, watch::Receiver<State<T>>, S>>,
 }
 
 pub type DefaultUnaryGroup<T> = UnaryGroup<String, T>;
 
-impl<K, T> Debug for UnaryGroup<K, T> {
+impl<K, T, S> Debug for UnaryGroup<K, T, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UnaryGroup").finish()
     }
 }
 
-impl<K, T> Default for UnaryGroup<K, T> {
+impl<K, T, S> Default for UnaryGroup<K, T, S>
+where
+    S: Default,
+{
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<K, T> UnaryGroup<K, T> {
-    /// Create a new Group to do work with.
-    #[must_use]
-    pub fn new() -> UnaryGroup<K, T> {
         Self {
-            map: Mutex::new(HashMap::new()),
+            map: Mutex::new(HashMap::<K, watch::Receiver<State<T>>, S>::default()),
         }
     }
 }
 
-impl<K, T> UnaryGroup<K, T>
+impl<K, T, S> UnaryGroup<K, T, S>
+where
+    S: Default,
+{
+    /// Create a new Group to do work with.
+    #[must_use]
+    pub fn new() -> UnaryGroup<K, T, S> {
+        Self::default()
+    }
+}
+
+impl<K, T, S> UnaryGroup<K, T, S>
 where
     T: Clone + Send + Sync,
     K: Hash + Eq + Send + Sync,
+    S: BuildHasher,
 {
     async fn work_inner<Q, F>(&self, key: &Q, fut: &mut Option<F>) -> Option<T>
     where

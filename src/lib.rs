@@ -38,6 +38,7 @@
 
 use std::fmt::{self, Debug};
 use std::future::Future;
+use std::hash::BuildHasher;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -51,8 +52,8 @@ pub use unary::*;
 use pin_project::{pin_project, pinned_drop};
 use std::collections::HashMap;
 use std::hash::Hash;
-use tokio::sync::watch;
-use tokio::sync::Mutex;
+use std::hash::RandomState;
+use tokio::sync::{watch, Mutex};
 
 #[derive(Clone)]
 enum State<T> {
@@ -234,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_leader() {
-        let group = Arc::new(Group::new());
+        let group = Arc::new(DefaultGroup::new());
 
         // Signal when the leader's inner future gets polled (implies map entry inserted).
         let (ready_tx, ready_rx) = oneshot::channel::<()>();

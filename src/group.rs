@@ -2,22 +2,39 @@ use super::*;
 
 /// Group represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
-pub struct Group<K, T, E> {
-    map: Mutex<HashMap<K, watch::Receiver<State<T>>>>,
+pub struct Group<K, T, E, S = RandomState> {
+    map: Mutex<HashMap<K, watch::Receiver<State<T>>, S>>,
     _marker: PhantomData<fn(E)>,
 }
 
 pub type DefaultGroup<T, E = ()> = Group<String, T, E>;
 
-impl<K, T, E> Debug for Group<K, T, E> {
+impl<K, T, E, S> Debug for Group<K, T, E, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Group").finish()
     }
 }
 
-impl<K, T, E> Default for Group<K, T, E> {
+impl<K, T, E, S> Default for Group<K, T, E, S>
+where
+    S: Default,
+{
     fn default() -> Self {
-        Self::new()
+        Self {
+            map: Mutex::new(HashMap::<K, watch::Receiver<State<T>>, S>::default()),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<K, T, E, S> Group<K, T, E, S>
+where
+    S: Default,
+{
+    /// Create a new Group to do work with.
+    #[must_use]
+    pub fn new() -> Group<K, T, E, S> {
+        Self::default()
     }
 }
 
@@ -41,21 +58,11 @@ impl<E> GroupWorkError<E> {
     }
 }
 
-impl<K, T, E> Group<K, T, E> {
-    /// Create a new Group to do work with.
-    #[must_use]
-    pub fn new() -> Group<K, T, E> {
-        Self {
-            map: Mutex::new(HashMap::new()),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<K, T, E> Group<K, T, E>
+impl<K, T, E, S> Group<K, T, E, S>
 where
     T: Clone,
     K: Hash + Eq,
+    S: BuildHasher,
 {
     async fn work_inner<Q, F>(&self, key: &Q, fut: &mut Option<F>) -> Result<T, GroupWorkError<E>>
     where
