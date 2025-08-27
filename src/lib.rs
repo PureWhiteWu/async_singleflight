@@ -9,7 +9,7 @@
 //! use std::sync::Arc;
 //! use std::time::Duration;
 //!
-//! use async_singleflight::Group;
+//! use async_singleflight::DefaultGroup;
 //!
 //! const RES: usize = 7;
 //!
@@ -20,7 +20,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let g = Arc::new(Group::<_, ()>::new());
+//!     let g = Arc::new(DefaultGroup::<usize>::new());
 //!     let mut handlers = Vec::new();
 //!     for _ in 0..10 {
 //!         let g = g.clone();
@@ -38,6 +38,7 @@
 
 use std::fmt::{self, Debug};
 use std::future::Future;
+use std::hash::BuildHasher;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -48,42 +49,43 @@ mod unary;
 pub use group::*;
 pub use unary::*;
 
-use dashmap::DashMap;
 use pin_project::{pin_project, pinned_drop};
+use std::collections::HashMap;
 use std::hash::Hash;
-use tokio::sync::watch;
+use std::hash::RandomState;
+use tokio::sync::{watch, Mutex};
 
 #[derive(Clone)]
-enum State<T: Clone> {
+enum State<T> {
     Starting,
     LeaderDropped,
     LeaderFailed,
     Success(T),
 }
 
-enum ChannelHandler<T: Clone> {
+enum ChannelHandler<T> {
     Sender(watch::Sender<State<T>>),
     Receiver(watch::Receiver<State<T>>),
 }
 
 #[pin_project(PinnedDrop)]
-struct Leader<T: Clone, F, Output> {
+struct Leader<T, F, Output>
+where
+    T: Clone,
+    F: Future<Output = Output>,
+{
     #[pin]
     fut: F,
     tx: watch::Sender<State<T>>,
-    _marker: PhantomData<Output>,
 }
 
 impl<T, F, Output> Leader<T, F, Output>
 where
     T: Clone,
+    F: Future<Output = Output>,
 {
     fn new(fut: F, tx: watch::Sender<State<T>>) -> Self {
-        Self {
-            fut,
-            tx,
-            _marker: PhantomData,
-        }
+        Self { fut, tx }
     }
 }
 
@@ -91,6 +93,7 @@ where
 impl<T, F, Output> PinnedDrop for Leader<T, F, Output>
 where
     T: Clone,
+    F: Future<Output = Output>,
 {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
@@ -165,7 +168,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple() {
-        let g = Group::new();
+        let g = DefaultGroup::new();
         let res = g.work("key", return_res()).await;
         let r = res.unwrap();
         assert_eq!(r, 7);
@@ -177,7 +180,7 @@ mod tests {
 
         use futures::future::join_all;
 
-        let g = Arc::new(Group::new());
+        let g = Arc::new(DefaultGroup::new());
         let mut handlers = Vec::with_capacity(10);
         for _ in 0..10 {
             let g = g.clone();
@@ -197,7 +200,7 @@ mod tests {
 
         use futures::future::join_all;
 
-        let g = Arc::new(Group::<_, _, u64>::new());
+        let g = Arc::new(Group::<u64, usize, ()>::new());
         let mut handlers = Vec::with_capacity(10);
         for _ in 0..10 {
             let g = g.clone();
@@ -217,7 +220,7 @@ mod tests {
 
         use futures::future::join_all;
 
-        let g = Arc::new(UnaryGroup::<_, u64>::new());
+        let g = Arc::new(UnaryGroup::<u64, usize>::new());
         let mut handlers = Vec::with_capacity(10);
         for _ in 0..10 {
             let g = g.clone();
@@ -232,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_leader() {
-        let group = Arc::new(Group::new());
+        let group = Arc::new(DefaultGroup::new());
 
         // Signal when the leader's inner future gets polled (implies map entry inserted).
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
@@ -277,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_leader_no_retry() {
-        let group = Arc::new(Group::new());
+        let group = Arc::new(DefaultGroup::<usize>::new());
 
         // Signal when the leader's inner future gets polled (implies map entry inserted).
         let (ready_tx, ready_rx) = oneshot::channel::<()>();

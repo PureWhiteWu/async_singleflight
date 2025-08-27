@@ -2,69 +2,75 @@ use super::*;
 
 /// UnaryGroup represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
-pub struct UnaryGroup<T, K = String>
-where
-    T: Clone,
-    K: Hash + Eq,
-{
-    map: DashMap<K, watch::Receiver<State<T>>>,
+pub struct UnaryGroup<K, T, S = RandomState> {
+    map: Mutex<HashMap<K, watch::Receiver<State<T>>, S>>,
 }
 
-impl<T> Debug for UnaryGroup<T>
-where
-    T: Clone,
-{
+pub type DefaultUnaryGroup<T> = UnaryGroup<String, T>;
+
+impl<K, T, S> Debug for UnaryGroup<K, T, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UnaryGroup").finish()
     }
 }
 
-impl<T> Default for UnaryGroup<T>
+impl<K, T, S> Default for UnaryGroup<K, T, S>
 where
-    T: Clone + Send + Sync,
+    S: Default,
 {
     fn default() -> Self {
-        Self::new()
+        Self {
+            map: Mutex::new(HashMap::<K, watch::Receiver<State<T>>, S>::default()),
+        }
     }
 }
 
-impl<T, K> UnaryGroup<T, K>
+impl<K, T, S> UnaryGroup<K, T, S>
 where
-    T: Clone + Send + Sync,
-    K: Hash + Eq + Send + Sync,
+    S: Default,
 {
     /// Create a new Group to do work with.
     #[must_use]
-    pub fn new() -> UnaryGroup<T, K> {
-        Self {
-            map: DashMap::new(),
-        }
+    pub fn new() -> UnaryGroup<K, T, S> {
+        Self::default()
     }
+}
 
+impl<K, T, S> UnaryGroup<K, T, S>
+where
+    T: Clone + Send + Sync,
+    K: Hash + Eq + Send + Sync,
+    S: BuildHasher,
+{
     async fn work_inner<Q, F>(&self, key: &Q, fut: &mut Option<F>) -> Option<T>
     where
-        Q: Hash + Eq + ?Sized + ToOwned<Owned = K> + Send + Sync,
+        Q: Hash + Eq + ?Sized + Send + Sync + ToOwned<Owned = K>,
         F: Future<Output = T> + Send,
         K: std::borrow::Borrow<Q>,
     {
-        let handler = if let Some(state_ref) = self.map.get(key) {
-            let state = state_ref.borrow().clone();
-            match state {
-                State::Starting => ChannelHandler::Receiver(state_ref.clone()),
-                State::LeaderDropped => {
-                    drop(state_ref);
-                    // switch into leader if leader dropped
+        let handler = {
+            let mut locked_map = self.map.lock().await;
+            match locked_map.get_mut(key) {
+                Some(state_ref) => {
+                    let state = state_ref.borrow().clone();
+                    match state {
+                        State::Starting => ChannelHandler::Receiver(state_ref.clone()),
+                        State::LeaderDropped => {
+                            // switch into leader if leader dropped
+                            let (tx, rx) = watch::channel(State::Starting);
+                            *state_ref = rx;
+                            ChannelHandler::Sender(tx)
+                        }
+                        State::Success(val) => return Some(val),
+                        State::LeaderFailed => unreachable!(),
+                    }
+                }
+                None => {
                     let (tx, rx) = watch::channel(State::Starting);
-                    self.map.insert(key.to_owned(), rx);
+                    locked_map.insert(key.to_owned(), rx);
                     ChannelHandler::Sender(tx)
                 }
-                State::Success(val) => return Some(val),
-                State::LeaderFailed => unreachable!(),
             }
-        } else {
-            let (tx, rx) = watch::channel(State::Starting);
-            self.map.insert(key.to_owned(), rx);
-            ChannelHandler::Sender(tx)
         };
 
         match handler {
@@ -75,7 +81,7 @@ where
                     tx,
                 );
                 let result = leader.await;
-                let _ = self.map.remove(key);
+                self.map.lock().await.remove(key);
                 Some(result)
             }
             ChannelHandler::Receiver(mut rx) => {
@@ -86,7 +92,7 @@ where
                 }
                 match state {
                     State::LeaderDropped => {
-                        let _ = self.map.remove(key);
+                        self.map.lock().await.remove(key);
                         // the leader dropped
                         None
                     }
@@ -104,7 +110,7 @@ where
     ///   call completes and return the same value.
     pub async fn work<Q, F>(&self, key: &Q, fut: F) -> T
     where
-        Q: Hash + Eq + ?Sized + ToOwned<Owned = K> + Send + Sync,
+        Q: Hash + Eq + ?Sized + Send + Sync + ToOwned<Owned = K>,
         F: Future<Output = T> + Send,
         K: std::borrow::Borrow<Q>,
     {
@@ -127,7 +133,7 @@ where
     /// - If the leader drops, the call will return `None`.
     pub async fn work_no_retry<Q, F>(&self, key: &Q, fut: F) -> Option<T>
     where
-        Q: Hash + Eq + ?Sized + ToOwned<Owned = K> + Send + Sync,
+        Q: Hash + Eq + ?Sized + Send + Sync + ToOwned<Owned = K>,
         F: Future<Output = T> + Send,
         K: std::borrow::Borrow<Q>,
     {
