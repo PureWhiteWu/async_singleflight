@@ -64,7 +64,12 @@ where
     K: Hash + Eq,
     S: BuildHasher,
 {
-    async fn work_inner<Q, F>(&self, key: &Q, fut: &mut Option<F>) -> Result<T, GroupWorkError<E>>
+    async fn work_inner<Q, F>(
+        &self,
+        key: &Q,
+        fut: &mut Option<F>,
+        is_retry: bool,
+    ) -> Result<T, GroupWorkError<E>>
     where
         Q: Hash + Eq + ?Sized + Send + Sync + ToOwned<Owned = K>,
         F: Future<Output = Result<T, E>> + Send,
@@ -83,8 +88,24 @@ where
                             *state_ref = rx;
                             ChannelHandler::Sender(tx)
                         }
-                        State::Success(val) => return Ok(val),
-                        State::LeaderFailed => return Err(GroupWorkError::LeaderFailed),
+                        State::Success(val) => {
+                            if is_retry {
+                                // A promoted leader already completed; return cached result.
+                                return Ok(val);
+                            }
+                            // Stale entry from a completed promoted leader; start fresh.
+                            let (tx, rx) = watch::channel(State::Starting);
+                            *state_ref = rx;
+                            ChannelHandler::Sender(tx)
+                        }
+                        State::LeaderFailed => {
+                            if is_retry {
+                                return Err(GroupWorkError::LeaderFailed);
+                            }
+                            let (tx, rx) = watch::channel(State::Starting);
+                            *state_ref = rx;
+                            ChannelHandler::Sender(tx)
+                        }
                     }
                 }
                 None => {
@@ -103,7 +124,13 @@ where
                     tx,
                 );
                 let result = leader.await;
-                self.map.lock().await.remove(key);
+                // Only the original leader removes the entry. Promoted leaders
+                // (is_retry=true) leave the entry so late-arriving retrying
+                // followers can read the cached result instead of becoming
+                // spurious independent leaders.
+                if !is_retry {
+                    self.map.lock().await.remove(key);
+                }
                 match result {
                     Ok(val) => Ok(val),
                     Err(err) => Err(GroupWorkError::Error(err)),
@@ -118,7 +145,6 @@ where
                 match state {
                     State::Starting => unreachable!(), // unreachable
                     State::LeaderDropped => {
-                        self.map.lock().await.remove(key);
                         // the leader dropped
                         Err(GroupWorkError::LeaderDropped)
                     }
@@ -143,12 +169,14 @@ where
         K: std::borrow::Borrow<Q>,
     {
         let mut fut_opt = Some(fut);
+        let mut is_retry = false;
 
         // Use a loop to avoid async tail recursion on leader dropped
         loop {
-            match self.work_inner(key, &mut fut_opt).await {
+            match self.work_inner(key, &mut fut_opt, is_retry).await {
                 Err(GroupWorkError::LeaderDropped) => {
                     // Retry the loop, potentially becoming leader, and consuming the future
+                    is_retry = true;
                     continue;
                 }
                 Ok(val) => return Ok(val),
@@ -156,6 +184,26 @@ where
                 Err(GroupWorkError::LeaderFailed) => return Err(None),
             }
         }
+    }
+
+    /// Remove completed entries left by promoted leaders after leader-drop recovery.
+    ///
+    /// When a leader is dropped and a follower takes over, the promoted leader
+    /// leaves its result cached in the map so that late-arriving retriers can read
+    /// it. These entries are automatically replaced by the next fresh [`work`] call
+    /// for the same key, but if no new call arrives, they persist.
+    ///
+    /// This method removes all such completed entries. It is safe to call at any
+    /// time, though calling it while leader-drop recovery is actively in progress
+    /// for a key may cause a late retrier to re-execute the work function for that
+    /// key (a benign but redundant execution).
+    ///
+    /// [`work`]: Self::work
+    pub async fn purge_stale(&self) {
+        self.map.lock().await.retain(|_, rx| {
+            let state = rx.borrow();
+            matches!(&*state, State::Starting)
+        });
     }
 
     /// Execute and return the value for a given function, making sure that only one
@@ -173,6 +221,6 @@ where
         K: std::borrow::Borrow<Q>,
     {
         let mut fut_opt = Some(fut);
-        self.work_inner(key, &mut fut_opt).await
+        self.work_inner(key, &mut fut_opt, false).await
     }
 }
