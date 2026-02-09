@@ -1,6 +1,6 @@
 [package]
 name = "async_singleflight"
-version = "0.6.1"
+version = "0.6.2"
 authors = ["Pure White <wudi@purewhite.io>"]
 edition = "2021"
 description = "Async singleflight."
